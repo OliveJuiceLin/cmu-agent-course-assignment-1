@@ -6,6 +6,7 @@ supply only their own tools and tool executors.
 
 from __future__ import annotations
 
+import yaml
 from copy import deepcopy
 import json
 import logging
@@ -30,7 +31,25 @@ MAX_OBSERVATION_CHARS = 10_000
 # TODO(Part 2): Write instructions that make the model produce concise working
 # memory for a software agent. The prompt should preserve concrete progress,
 # failures, test results, constraints, and next steps without copying raw output.
-COMPACTION_SYSTEM_PROMPT = ""
+COMPACTION_SYSTEM_PROMPT = """You compress a software agent's ReAct transcript into concise, factual working memory.
+
+Write a compact summary that a fresh agent could use to continue the task without re-reading the transcript. Preserve, when present:
+- the objective and any constraints or requirements
+- files inspected or modified (with paths)
+- commands run and their concrete results
+- edits made (what changed and where)
+- failed approaches and why they failed
+- tests run and their outcomes
+- blockers or open questions
+- the next action to take
+
+Rules:
+- Be factual and specific. Keep exact paths, identifiers, error messages, and numbers.
+- Do not copy raw command output; summarize what it showed.
+- Do not invent details that are not in the transcript.
+- Do not include tool call syntax or JSON; write plain prose or short bullets.
+- Keep it under a few hundred words.
+"""
 
 
 class StepLimitError(Exception):
@@ -143,6 +162,15 @@ class Agent:
         self.steps_taken = 0
 
         self.skills_path = Path(skills_path) if skills_path is not None else None
+        # self.skills形如：
+        
+        # {
+        #     "submit-task": {                    # ← 键 = frontmatter 的 name
+        #         "metadata": "name: submit-task\ndescription: When the task is complete...",
+        #         "content": "---\nname: submit-task\n...\n# Step 1: ...",   # ← 完整文件内容
+        #     }
+        # }
+        
         self.skills: dict[str, dict[str, str]] = (
             self.load_skills(self.skills_path) if self.skills_path is not None else {}
         )
@@ -152,6 +180,9 @@ class Agent:
 
         # TODO(1.1.a): Add machinery to maintain agent state as it takes actions
         # and observes the results.
+        # self.message的设计很奇怪，它只储存交互的历史，而一开始的系统提示和任务提示
+        # 分别储存在 self.system_prompt 和 self.task_prompt 中。
+        self.messages: list[dict[str, Any]] = []
 
     def load_skills(self, skills_path: Path) -> dict[str, dict[str, str]]:
         """Load the skill folders exposed to this agent."""
@@ -164,10 +195,58 @@ class Agent:
         # ``content`` of the skill file for ``invoke_skill``. Reject duplicate
         # names and malformed or missing frontmatter with a clear
         # ``ValueError``.
-        raise NotImplementedError
+        # 解析 Path 下面每一个子文件夹的 SKILL.md，返回一个字典，键是每一个技能的名字，值是这个技能的字典，
+        # 包括 yaml 头和完整内容
+        if not skills_path.is_dir():
+            raise ValueError(f"skills_path is not a directory: {skills_path}")
+        skills: dict[str, dict[str, str]] = {}
+        for child in sorted(skills_path.iterdir()): # sorted保证顺序稳定
+            if not child.is_dir():
+                continue
+            skill_file = child / "SKILL.md"
+            if not skill_file.is_file():
+                continue
+            # 是一个子文件夹，且下面的 SKILL.md 是一个文件
+            text = skill_file.read_text(encoding="utf-8")
 
+            
+            if not text.startswith("---"):
+                raise ValueError(f"{skill_file} is missing YAML frontmatter")
+            # maxsplit=2 的关键作用就是：只切前两个 ---，把后面所有内容（包括正文中可能出现---）都完整保留在 parts［2］里。
+            # if Len（parts）<3 就是判断：如果连两个---都没有（切不出3段），说明frontmatter格式不合法，抛 VaLueError。
+            parts = text.split("---", 2)
+            if len(parts) < 3:
+                raise ValueError(f"{skill_file} has malformed frontmatter")
+            
+            try:
+                frontmatter = yaml.safe_load(parts[1])
+            except yaml.YAMLError as exc:
+                raise ValueError(
+                    f"{skill_file} has invalid YAML frontmatter: {exc}"
+                ) from exc
+
+            name = frontmatter.get("name")
+            description = frontmatter.get("description")
+
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"{skill_file} is missing a valid 'name'")
+            if not isinstance(description, str) or not description.strip():
+                raise ValueError(f"{skill_file} is missing a valid 'description'")
+
+            if name in skills:
+                raise ValueError(f"duplicate skill name: {name!r}")
+
+            skills[name] = {
+                "metadata": f"name: {name}\ndescription: {description}",
+                "content": text,
+            }
+        return skills
+    
     def query_language_model(self) -> dict[str, Any]:
-        """Send one tool-enabled Chat Completions request and normalize it."""
+        """
+        调用 build_prompt 方法构建完整的 prompt，然后发送一个启用工具的 Chat Completions 请求并进行标准化。
+        返回 assistant 的下一步 action 和 reasoning，供 run 方法使用
+        """
 
         messages = self.build_prompt()
         self.api_prompts.append(deepcopy(messages))
@@ -218,6 +297,9 @@ class Agent:
         return response.choices[0].message.model_dump(exclude_none=True)
 
     def build_prompt(self) -> list[dict[str, Any]]:
+        """
+        作用：把 system_prompt、task_prompt 和 messages 拼接成一个完整的 prompt，供 query_language_model 使用
+        """
         # TODO(1.1.a): Construct a sequence of messages that form the language
         # model prompt. This should include standing instructions, task
         # specification, prior interaction including observations, reasoning,
@@ -227,7 +309,12 @@ class Agent:
 
         # You want to be careful about which attributes of the class you modify
         # here as they may also be handled by the subclasses.
-        raise NotImplementedError
+        prompt: list[dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": self.task_prompt},
+        ]
+        prompt.extend(self.messages)
+        return prompt
 
     def estimate_active_prompt_tokens(self) -> int:
         """Estimate the next prompt, calibrated by the provider's latest usage."""
@@ -252,7 +339,7 @@ class Agent:
 
         return self.compact_threshold_tokens is not None
 
-    def compact_context(self):
+    def compact_context(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Replace parts of prompt with model-generated working memory. Changes the
         content that `build_prompt` emits."""
 
@@ -265,9 +352,51 @@ class Agent:
         # with all linked tool observations. The resulting summary should change
         # what `build_prompt` emits, and reduce the length of the prompt.
 
-        raise NotImplementedError
+        # 把 transcript 按"步骤"分组：每个步骤从一条 assistant 消息开始，
+        # 包含它后面所有关联的 tool 观察结果。
+        assistant_indices = [
+            index
+            for index, message in enumerate(self.messages)  # list of dict, each dict represents a message in the conversation, 注意，self.messages 里面没有 system 消息以及 task prompt，它只储存 assistant 消息和 tool 消息
+            if message.get("role") == "assistant"
+        ] # [1, 3, 5, ...] 例如，如果 assistant 消息在索引 1, 3, 5 处，则 assistant_indices = [1, 3, 5]
 
-        compaction_prompt = []
+        keep = max(1, self.compaction_keep_recent_steps) # 例如，如果 compaction_keep_recent_steps 是 3，则保留最近 3 个步骤
+        if len(assistant_indices) <= keep: # 如果步骤数不超过要保留的数量，则无需压缩
+            return [], {}
+
+        cut_index: int = assistant_indices[-keep]
+        old_prefix: list[dict] = self.messages[:cut_index] # keep之前的
+        recent_suffix: list[dict] = self.messages[cut_index:] # keep及之后的
+
+        transcript_parts: list[str] = [] # 
+        for message in old_prefix:
+            role = message.get("role", "unknown")
+            transcript_parts.append(f"[{role}]")
+            content = message.get("content", "")
+            if content:
+                transcript_parts.append(str(content))
+            for call in message.get("tool_calls", []):
+                function = call.get("function", {}) # {name, arguments}
+                transcript_parts.append(
+                    f"Tool call: {function.get('name', 'unknown')} "
+                    f"Arguments: {function.get('arguments', '')}"
+                )
+            transcript_parts.append("") # 
+        transcript: str = "\n".join(transcript_parts)
+        compaction_prompt = [
+            {"role": "system", "content": COMPACTION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Task:\n"
+                    f"{self.task_prompt}\n\n"
+                    "Transcript to summarize:\n"
+                    f"{transcript}"
+                ),
+            },
+        ] # 告诉模型任务要求，提供需要总结、压缩的对话记录
+
+
 
         ### Do not modify this section ###
         compaction_response = self.client.chat.completions.create(
@@ -280,7 +409,17 @@ class Agent:
 
         # Use `compaction_response` to update what `build_prompt` emits, but
         # DO NOT modify the object itself. Let the method return it unchanged.
-
+        summary: str = compaction_response.choices[0].message.content or ""
+        self.messages = [
+            {
+                "role": "user",
+                "content": (
+                    "Working memory from earlier steps (compacted):\n"
+                    f"{summary}"
+                ),
+            },
+            *recent_suffix,
+        ]
         ### Do not modify this section ###
         return compaction_prompt, compaction_response.model_dump(mode="json")
         ##################################
@@ -330,13 +469,50 @@ class Agent:
             # step. Ensure you identify when the agent has completed the task
             # by setting `Agent.finished`. If the agent exceeds the
             # `step_limit`, raise `StepLimitError`.
+            while not self.finished: # 在 agent 没有完成任务的情况下，最多执行 step_limit 次
+                if self.steps_taken >= self.step_limit:
+                    raise StepLimitError(
+                        f"Agent exceeded step limit of {self.step_limit}"
+                    )
+                self.maybe_compact_context()   # ← TODO 2.2 的位置，调用 compact
+                message = self.query_language_model() # query_language_model 返回的就是 assistant 下一步的 action和 reasoning
+                self.messages.append(message) # 将 assistant 的 action 和 reasoning 添加到 messages 中，供下一次 query_language_model 使用
+                # 例如： assistant：LLM 第 1 步的生成 —— 决定调用 execute 工具
+                # {
+                #     "role": "assistant",
+                #     "content": "Let me first look at the directory structure.",
+                #     "tool_calls": [
+                #     {
+                #         "id": "call_abc",
+                #         "type": "function",
+                #         "function": {"name": "execute", "arguments": "{\"command\": \"ls -la\"}"}
+                #     }
+                #     ]
+                # },
+                # 有可能message 里面没有 tool_calls，可能是因为模型没有生成 tool_calls，或者生成的 tool_calls 为空列表，所以这里需要做一个判断
+                tool_calls = message.get("tool_calls") or []
+                # tool_calls长什么样：
+                # [
+                #     {
+                #         "id": "call_1",
+                #         "type": "function",
+                #         "function": {
+                #         "name": "execute",
+                #         "arguments": "{\"command\": \"ls -la\"}"   # ← 注意：是 JSON 字符串！
+                #         }
+                #     }
+                # ]
+                if tool_calls:
+                    observations: list[dict[str, str]] = self.execute_tool_calls(tool_calls) # 执行 tool_calls，返回 observations
+                    self.messages.extend(observations)
+                
 
             # TODO(2.2) Call `maybe_compact_context()` before each new action
             # request in your shared loop. It already estimates active tokens
             # and handles the threshold, and tracks compaction events for
             # logging.
 
-            raise NotImplementedError
+            
         finally:
             # This block is provided infrastructure. Do not modify it: a
             # trajectory is required even when a run fails.

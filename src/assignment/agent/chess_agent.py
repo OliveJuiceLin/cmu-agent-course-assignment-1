@@ -107,8 +107,9 @@ class ChessAgent(Agent):
         )
 
         # TODO(Part 3): Register the play_move tool schema from tools.py.
-
+        self.tools.append(PLAY_MOVE_TOOL)
         if programmatic_tools:
+            self.tools.append(SIMULATE_MOVE_TOOL)      # ← 新增
             self.tools.append(RUN_PYTHON_TOOL)
 
         # run_python always executes in the sandbox, on the port the chess
@@ -177,4 +178,61 @@ class ChessAgent(Agent):
 
         # TODO(Part 3.3-4): add cases for simulate_move and run_python, with
         # linked observations and recoverable errors, just like the old tool.
-        raise NotImplementedError
+        observations: list[dict[str, str]] = []
+        move_played = False          # ← 并行保护标志，也就是说，即便模型给出了多个  tool_calls，调用了多次 play_move，也只执行第一次。
+
+        for call in tool_calls:
+            call_id = call.get("id", "")
+            function = call.get("function", {})
+            name = function.get("name", "")
+            raw_arguments = function.get("arguments", "")
+            if name == "play_move":
+                if move_played:
+                    content = (
+                        "<chess_error>Only one move can be played per turn; this "
+                        "call was ignored because the position already changed."
+                        "</chess_error>"
+                    )
+                else:
+                    result = _play_move(self.chess_client, raw_arguments)
+                    if result.startswith("<chess_error>"):
+                        content = result
+                    else:
+                        state = json.loads(result)
+                        self.last_state = state
+                        self.finished = bool(state.get("game_over"))
+                        content = self.format_state(state)
+                    move_played = True
+            elif name == "simulate_move":
+                # simulate_move 不更新 last_state / finished，也不参与 move_played 并行保护——因为它不改变对局，可以并行调用任意多次。
+                content = _simulate_move(self.chess_client, raw_arguments)
+            elif name == "run_python":
+                content = _run_python(
+                    self.env, self.python_sandbox_port, raw_arguments
+                )
+                move_played = True
+                # 代码可能已经调过 play_move，实时局面变了。
+                # 重新读一次，避免模型重放已经走过的棋。
+                try:
+                    state = _game_state(self.chess_client)
+                except (ValueError, RuntimeError, httpx.HTTPError) as exc:
+                    content += f"\n<chess_error>Could not refresh the board: {exc}</chess_error>"
+                else:
+                    self.last_state = state
+                    self.finished = bool(state.get("game_over"))
+                    content += "\n" + self.format_state(state)
+            elif name == "invoke_skill":
+                content = _invoke_skill(self.skills, raw_arguments)
+            else:
+                content = f"<chess_error>Unknown tool: {name!r}</chess_error>"
+
+            observations.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": content,
+                }
+            )
+
+        return observations
+            

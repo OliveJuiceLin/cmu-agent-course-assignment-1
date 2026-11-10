@@ -10,3 +10,8 @@ data/*
 !data/README.md
 !data/.gitkeep
 .env
+cmu-agent-assignment-1-submission.zip
+.DS_Store
+
+# 207 MB, exceeds GitHub 100 MB limit; included in the submission ZIP instead
+artifacts/part3-legal-moves-deepseek.json
